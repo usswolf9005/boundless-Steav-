@@ -59,7 +59,7 @@ struct MainArgs {
     #[clap(short, long, default_value = "0")]
     lock_stake_raw: U256,
     /// Number of seconds, from the current time, before the auction period starts.
-    #[clap(long, default_value = "30")]
+    #[clap(long, default_value = "0")] // Reduced from 30 to 0 for immediate bidding
     bidding_start_delay: u64,
     /// Ramp-up period in seconds.
     ///
@@ -333,7 +333,7 @@ mod tests {
             min_price_per_mcycle: parse_ether("0.001").unwrap(),
             max_price_per_mcycle: parse_ether("0.002").unwrap(),
             lock_stake_raw: parse_ether("0.0").unwrap(),
-            bidding_start_delay: 30,
+            bidding_start_delay: 0,
             ramp_up: 0,
             timeout: 1000,
             lock_timeout: 1000,

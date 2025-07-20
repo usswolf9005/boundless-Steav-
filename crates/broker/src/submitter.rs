@@ -585,7 +585,7 @@ where
                 }
 
                 // TODO: configuration
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; // Reduced from 1 second to 100ms for faster processing
             }
             Ok(())
         })

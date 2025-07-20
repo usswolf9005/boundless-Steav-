@@ -411,60 +411,27 @@ where
             if order.request.expires_at() < current_block_timestamp {
                 tracing::debug!("Request {:x} has now expired. Skipping.", order.request.id);
                 false
-            } else if order.request.expires_at().saturating_sub(now_timestamp()) < min_deadline {
-                tracing::debug!("Request {:x} deadline at {} is less than the minimum deadline {} seconds required to prove an order. Skipping.", order.request.id, order.request.expires_at(), min_deadline);
-                false
             } else {
+                // ALWAYS allow orders to proceed - no deadline checks for immediate locking
+                tracing::debug!("Request {:x} deadline check bypassed (immediate locking enabled)", order.request.id);
                 true
             }
         }
 
         fn is_target_time_reached(order: &OrderRequest, current_block_timestamp: u64) -> bool {
-            // Note: this could use current timestamp, but avoiding cases where clock has drifted.
-            match order.target_timestamp {
-                Some(target_timestamp) => {
-                    if current_block_timestamp < target_timestamp {
-                        tracing::trace!(
-                            "Request {:x} target timestamp {} not yet reached (current: {}). Waiting.",
-                            order.request.id,
-                            target_timestamp,
-                            current_block_timestamp
-                        );
-                        false
-                    } else {
+            // ALWAYS allow orders to proceed - no target timestamp checks for immediate locking
+            tracing::debug!("Request {:x} target timestamp check bypassed (immediate locking enabled)", order.request.id);
                         true
                     }
-                }
-                None => {
-                    // Should not happen, just warning for safety as this condition is not strictly
-                    // enforced at compile time.
-                    tracing::warn!("Request {:x} has no target timestamp set", order.request.id);
-                    false
-                }
-            }
-        }
 
-        for (_, order) in self.prove_cache.iter() {
-            let is_fulfilled = self
-                .db
-                .is_request_fulfilled(U256::from(order.request.id))
-                .await
-                .context("Failed to check if request is fulfilled")?;
-            if is_fulfilled {
-                tracing::debug!(
-                    "Request 0x{:x} was locked by another prover and was fulfilled. Skipping.",
-                    order.request.id
-                );
-                self.skip_order(&order, "was fulfilled by other").await;
-            } else if !is_within_deadline(&order, current_block_timestamp, min_deadline) {
-                self.skip_order(&order, "expired").await;
-            } else if is_target_time_reached(&order, current_block_timestamp) {
-                tracing::info!("Request 0x{:x} was locked by another prover but expired unfulfilled, setting status to pending proving", order.request.id);
-                candidate_orders.push(order);
-            }
-        }
-
+        // Process only LockAndFulfill orders from lock_and_prove_cache
         for (_, order) in self.lock_and_prove_cache.iter() {
+            // Skip non-LockAndFulfill orders
+            if order.fulfillment_type != FulfillmentType::LockAndFulfill {
+                tracing::debug!("Skipping order {:x} as it is not LockAndFulfill", order.request.id);
+                continue;
+            }
+
             let is_lock_expired = order.request.lock_expires_at() < current_block_timestamp;
             if is_lock_expired {
                 tracing::debug!("Request {:x} was scheduled to be locked by us, but its lock has now expired. Skipping.", order.request.id);
@@ -608,211 +575,60 @@ where
         prev_orders_by_status: &mut String,
     ) -> Result<Vec<Arc<OrderRequest>>> {
         let num_orders = orders.len();
-        // Get our current capacity for proving orders given our config and the number of orders that are currently committed to be proven + fulfilled.
+        let capacity_granted = config.max_concurrent_proofs.unwrap_or(u32::MAX) as usize;
+        let mut final_orders: Vec<Arc<OrderRequest>> = Vec::new();
+
+        // Get committed orders and capacity
+        let committed_orders = self.db.get_committed_orders().await?;
         let capacity = self
             .get_proving_order_capacity(config.max_concurrent_proofs, prev_orders_by_status)
             .await?;
-        let capacity_granted: usize = capacity
-            .request_capacity(num_orders.try_into().expect("Failed to convert order count to u32"))
-            as usize;
 
-        tracing::info!(
-            "Num orders ready for locking and/or proving: {}. Total capacity available: {capacity:?}, Capacity granted: {capacity_granted:?}",
-            num_orders
-        );
+        // Log capacity information
+        self.log_capacity(prev_orders_by_status, committed_orders.clone(), capacity_granted as u32).await;
 
-        let mut final_orders: Vec<Arc<OrderRequest>> = Vec::with_capacity(capacity_granted);
+        // Skip if no capacity available
+        let capacity_available = match capacity {
+            Capacity::Available(capacity) => capacity as usize,
+            Capacity::Unlimited => usize::MAX,
+        };
 
-        // Get current gas price and available balance
-        let gas_price =
-            self.chain_monitor.current_gas_price().await.context("Failed to get gas price")?;
-        let available_balance_wei = self
-            .provider
-            .get_balance(self.provider.default_signer_address())
-            .await
-            .map_err(|err| OrderMonitorErr::RpcErr(err.into()))?;
-
-        // Calculate gas units required for committed orders
-        let committed_orders = self.db.get_committed_orders().await?;
-        let committed_gas_units =
-            futures::future::try_join_all(committed_orders.iter().map(|order| {
-                utils::estimate_gas_to_fulfill(
-                    &self.config,
-                    &self.supported_selectors,
-                    &order.request,
-                )
-            }))
-            .await?
-            .iter()
-            .sum::<u64>();
-
-        // Calculate cost in wei
-        let committed_cost_wei = U256::from(gas_price) * U256::from(committed_gas_units);
-
-        // Log committed order gas requirements
-        if !committed_orders.is_empty() {
-            tracing::debug!(
-                "Cost for {} committed orders: {} ether",
-                committed_orders.len(),
-                format_ether(committed_cost_wei),
-            );
-        }
-
-        // Ensure we have enough for committed orders
-        if committed_cost_wei > available_balance_wei {
-            tracing::error!(
-                "Insufficient balance for committed orders. Required: {} ether, Available: {} ether",
-                format_ether(committed_cost_wei),
-                format_ether(available_balance_wei)
-            );
+        if capacity_available == 0 {
+            tracing::debug!("No capacity available for proving orders");
             return Ok(Vec::new());
         }
 
-        // Calculate remaining balance after accounting for committed orders
-        let mut remaining_balance_wei = available_balance_wei - committed_cost_wei;
+        // Filter orders to only LockAndFulfill orders
+        let lock_and_fulfill_orders: Vec<Arc<OrderRequest>> = orders
+            .into_iter()
+            .filter(|order| order.fulfillment_type == FulfillmentType::LockAndFulfill)
+            .collect();
 
-        // Apply peak khz limit if specified
-        let num_commited_orders = committed_orders.len();
-        if config.peak_prove_khz.is_some() && !orders.is_empty() {
-            let peak_prove_khz = config.peak_prove_khz.unwrap();
-            let total_commited_cycles = committed_orders
-                .iter()
-                .map(|order| order.total_cycles.unwrap() + config.additional_proof_cycles)
-                .sum::<u64>();
-
-            let now = now_timestamp();
-            // Estimate the time the prover will be available given our current committed orders.
-            let started_proving_at = committed_orders
-                .iter()
-                .map(|order| order.proving_started_at.unwrap())
-                .min()
-                .unwrap_or(now);
-
-            let proof_time_seconds = total_commited_cycles.div_ceil(1_000).div_ceil(peak_prove_khz);
-            let mut prover_available_at = started_proving_at + proof_time_seconds;
-            if prover_available_at < now {
-                let seconds_behind = now - prover_available_at;
-                tracing::warn!("Proofs are behind what is estimated from peak_prove_khz config by {} seconds. Consider lowering this value to avoid overlocking orders.", seconds_behind);
-                prover_available_at = now;
-            }
-            tracing::debug!("Already committed to {} orders, with a total cycle count of {}, a peak khz limit of {}, started working on them at {}, we estimate the prover will be available in {} seconds", 
-                num_commited_orders,
-                total_commited_cycles,
-                peak_prove_khz,
-                started_proving_at,
-                prover_available_at.saturating_sub(now),
-            );
-
-            // For each order in consideration, check if it can be completed before its expiration
-            // and that there is enough gas to pay for the lock and fulfillment of all orders
-            // including the committed orders.
-            for order in orders {
-                if final_orders.len() >= capacity_granted {
-                    break;
-                }
-                // Calculate gas and cost for this order using our helper method
-                let order_cost_wei = self.calculate_order_gas_cost_wei(&order, gas_price).await?;
-
-                // Skip if not enough balance
-                if order_cost_wei > remaining_balance_wei {
-                    tracing::warn!(
-                        "Insufficient balance for order {}. Required: {} ether, Remaining: {} ether",
-                        order.id(),
-                        format_ether(order_cost_wei),
-                        format_ether(remaining_balance_wei)
-                    );
-                    self.skip_order(&order, "insufficient balance").await;
-                    continue;
-                }
-
-                let Some(order_cycles) = order.total_cycles else {
-                    tracing::warn!("Order 0x{:x} has no total cycles, preflight was skipped? Not considering for peak khz limit", order.request.id);
-                    final_orders.push(order);
-                    remaining_balance_wei -= order_cost_wei;
-                    continue;
-                };
-
-                // Calculate total cycles including application proof, assessor, and set builder estimates
-                let total_cycles = order_cycles + config.additional_proof_cycles;
-
-                let proof_time_seconds = total_cycles.div_ceil(1_000).div_ceil(peak_prove_khz);
-                let completion_time = prover_available_at + proof_time_seconds;
-                let expiration = match order.fulfillment_type {
-                    FulfillmentType::LockAndFulfill => order.request.lock_expires_at(),
-                    FulfillmentType::FulfillAfterLockExpire => order.request.expires_at(),
-                    _ => panic!("Unsupported fulfillment type: {:?}", order.fulfillment_type),
-                };
-
-                if completion_time + config.batch_buffer_time_secs > expiration {
-                    // If the order cannot be completed before its expiration, skip it permanently.
-                    // Otherwise, we keep the order for the next iteration as capacity may free up in the future.
-
-                    if now + proof_time_seconds > expiration {
-                        tracing::info!("Order 0x{:x} cannot be completed before its expiration at {}, proof estimated to take {} seconds and complete at {}. Skipping", 
-                            order.request.id,
-                            expiration,
-                            proof_time_seconds,
-                            completion_time
-                        );
-                        // If the order cannot be completed regardless of other orders, skip it
-                        // permanently. Otherwise, will retry including the order.
-                        self.skip_order(&order, "cannot be completed before expiration").await;
-                    } else {
-                        tracing::debug!("Given current commited orders and capacity, order 0x{:x} cannot be completed before its expiration. Not skipping as capacity may free up before it expires.", order.request.id);
-                    }
-                    continue;
-                }
-
-                tracing::debug!("Order {} estimated to take {} seconds (including assessor + set builder), and would be completed at {} ({} seconds from now). It expires at {} ({} seconds from now)", order.id(), proof_time_seconds, completion_time, completion_time.saturating_sub(now_timestamp()), expiration, expiration.saturating_sub(now_timestamp()));
-
-                final_orders.push(order);
-                prover_available_at = completion_time;
-                remaining_balance_wei -= order_cost_wei;
-            }
-        } else {
-            // If no peak khz limit, just check gas for each order
-            for order in orders {
-                if final_orders.len() >= capacity_granted {
-                    break;
-                }
-                let order_cost_wei = self.calculate_order_gas_cost_wei(&order, gas_price).await?;
-
-                // Skip if not enough balance
-                if order_cost_wei > remaining_balance_wei {
-                    tracing::warn!(
-                        "Insufficient balance for order {}. Required: {} ether, Remaining: {} ether",
-                        order.id(),
-                        format_ether(order_cost_wei),
-                        format_ether(remaining_balance_wei)
-                    );
-                    self.skip_order(&order, "insufficient balance").await;
-                    continue;
-                }
-
-                final_orders.push(order);
-                remaining_balance_wei -= order_cost_wei;
-            }
+        if lock_and_fulfill_orders.is_empty() {
+            tracing::debug!("No LockAndFulfill orders to process");
+            return Ok(Vec::new());
         }
 
+        // ALWAYS accept all LockAndFulfill orders immediately - bypass all gas and timing checks
         tracing::info!(
-            "Started with {} orders ready to be locked and/or proven. Already commited to {} orders. After applying capacity limits of {} max concurrent proofs and {} peak khz, filtered to {} orders: {:?}",
-            num_orders,
-            num_commited_orders,
-            if let Some(max_concurrent_proofs) = config.max_concurrent_proofs {
-                max_concurrent_proofs.to_string()
-            } else {
-                "unlimited".to_string()
-            },
-            if let Some(peak_prove_khz) = config.peak_prove_khz {
-                peak_prove_khz.to_string()
-            } else {
-                "unlimited".to_string()
-            },
-            final_orders.len(),
-            final_orders.iter().map(|order| order.id()).collect::<Vec<_>>()
+            "COMPETITIVE MODE: Accepting all {} LockAndFulfill orders immediately without gas/timing/balance checks for maximum competitive edge",
+            lock_and_fulfill_orders.len()
         );
 
-        Ok(final_orders)
+        // Take up to capacity_granted orders
+        let orders_to_process = lock_and_fulfill_orders
+            .into_iter()
+            .take(capacity_granted)
+            .collect::<Vec<_>>();
+
+        tracing::info!(
+            "COMPETITIVE MODE: Started with {} LockAndFulfill orders. After applying immediate locking (bypassing all checks), selected {} orders: {:?}",
+            num_orders,
+            orders_to_process.len(),
+            orders_to_process.iter().map(|order| order.id()).collect::<Vec<_>>()
+        );
+
+        Ok(orders_to_process)
     }
 
     pub async fn start_monitor(
@@ -823,7 +639,7 @@ where
         let mut first_block = 0;
         let mut interval = tokio::time::interval_at(
             tokio::time::Instant::now(),
-            tokio::time::Duration::from_secs(self.block_time),
+            tokio::time::Duration::from_millis(1), // Reduced to 1ms for maximum processing speed
         );
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 

@@ -123,7 +123,7 @@ where
                 .ok()
                 .and_then(|chain| chain.average_blocktime_hint())
                 .map(|block_time| block_time.mul_f32(0.6))
-                .unwrap_or(Duration::from_secs(2));
+                .unwrap_or(Duration::from_millis(500)); // Reduced from 2 seconds to 500ms for faster chain updates
 
             loop {
                 tokio::select! {

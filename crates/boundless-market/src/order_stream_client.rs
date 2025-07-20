@@ -401,10 +401,10 @@ pub fn order_stream(
                 },
                 Err(_) => {
                     tracing::warn!("Invalid ORDER_STREAM_CLIENT_PING_MS value: {}, using default", ms);
-                    tokio::time::Duration::from_secs(30)
+                    tokio::time::Duration::from_secs(1) // Reduced from 30 seconds to 1 second for faster updates
                 }
             },
-            Err(_) => tokio::time::Duration::from_secs(30),
+            Err(_) => tokio::time::Duration::from_secs(1), // Reduced from 30 seconds to 1 second for faster updates
         };
 
         let mut ping_interval = tokio::time::interval(ping_duration);

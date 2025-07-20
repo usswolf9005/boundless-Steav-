@@ -642,7 +642,7 @@ impl RetryTask for AggregatorService {
                         .context("Failed to lock config")
                         .map_err(AggregatorErr::UnexpectedErr)
                         .map_err(SupervisorErr::Recover)?;
-                    config.batcher.batch_poll_time_ms.unwrap_or(1000)
+                    config.batcher.batch_poll_time_ms.unwrap_or(100) // Reduced from 1000ms to 100ms for faster processing
                 };
 
                 self_clone.aggregate().await.map_err(SupervisorErr::Recover)?;

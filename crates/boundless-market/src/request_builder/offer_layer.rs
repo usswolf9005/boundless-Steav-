@@ -46,7 +46,7 @@ pub struct OfferLayerConfig {
     pub max_price_per_cycle: U256,
 
     /// Time in seconds to delay the start of bidding after request creation.
-    #[builder(default = "15")]
+    #[builder(default = "0")] // Reduced from 15 to 0 for immediate bidding
     pub bidding_start_delay: u64,
 
     /// Duration in seconds for the price to ramp up from min to max.

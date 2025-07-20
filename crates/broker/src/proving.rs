@@ -391,7 +391,7 @@ impl RetryTask for ProvingService {
             proving_service_copy.find_and_monitor_proofs().await.map_err(SupervisorErr::Fault)?;
 
             // Start monitoring for new proofs
-            let mut proving_interval = tokio::time::interval(Duration::from_millis(500));
+            let mut proving_interval = tokio::time::interval(Duration::from_millis(100)); // Reduced from 500ms to 100ms for faster processing
             proving_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 if cancel_token.is_cancelled() {
@@ -419,7 +419,7 @@ impl RetryTask for ProvingService {
                 }
 
                 // TODO: configuration
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await; // Reduced from 500ms to 100ms for faster processing
             }
 
             Ok(())

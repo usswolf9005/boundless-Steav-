@@ -59,7 +59,7 @@ pub(crate) struct RetryPolicy {
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
-            delay: std::time::Duration::from_millis(500),
+            delay: std::time::Duration::from_millis(100), // Reduced from 500ms to 100ms for faster recovery
             backoff_multiplier: 1.5,
             max_delay: std::time::Duration::from_secs(60),
             // Reset the backoff after 5 minutes of running without a failure.

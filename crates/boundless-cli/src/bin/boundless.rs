@@ -1168,11 +1168,10 @@ where
     // Fill in some of the request parameters, this command supports filling a few of the request
     // parameters that new need to updated on every reqeust. Namely, ID and bidding start.
     //
-    // If set to 0, override the offer bidding_start field with the current timestamp + 30s
+    // If set to 0, override the offer bidding_start field with the current timestamp (no delay)
     if request.offer.biddingStart == 0 {
-        // Adding a delay to bidding start lets provers see and evaluate the request
-        // before the price starts to ramp up
-        request.offer = Offer { biddingStart: now_timestamp() + 30, ..request.offer };
+        // COMPETITIVE EDGE: No delay to bidding start for immediate locking
+        request.offer = Offer { biddingStart: now_timestamp(), ..request.offer };
     }
     if request.id == U256::ZERO {
         request.id = client.boundless_market.request_id_from_rand().await?;
