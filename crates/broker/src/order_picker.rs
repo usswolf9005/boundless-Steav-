@@ -1,5 +1,3 @@
-// order_picker.rs
-
 // Copyright (c) 2025 RISC Zero, Inc.
 //
 // All rights reserved.
@@ -236,12 +234,6 @@ where
     ) -> Result<OrderPricingOutcome, OrderPickerErr> {
         let order_id = order.id();
         tracing::debug!("Pricing order {order_id}");
-        
-        // Skip orders that are not LockAndFulfill to avoid wasting compute
-        if order.fulfillment_type != FulfillmentType::LockAndFulfill {
-            tracing::info!("Skipping order {order_id} as it is not LockAndFulfill");
-            return Ok(Skip);
-        }
 
         // Short circuit if the order has been locked.
         if order.fulfillment_type == FulfillmentType::LockAndFulfill
