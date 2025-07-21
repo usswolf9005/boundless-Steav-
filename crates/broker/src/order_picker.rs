@@ -1,3 +1,5 @@
+// order_picker.rs
+
 // Copyright (c) 2025 RISC Zero, Inc.
 //
 // All rights reserved.
@@ -11,9 +13,9 @@ use crate::{
     config::{ConfigLock, OrderPricingPriority},
     db::DbObj,
     errors::CodedError,
-    provers::{ProverObj},
-    utils::{format_ether, parse_ether},
-    FulfillmentType, OrderRequest,
+    provers::ProverObj,
+    task::{RetryRes, RetryTask, SupervisorErr},
+    utils, FulfillmentType, OrderRequest,
 };
 use crate::{now_timestamp, provers::ProofResult};
 use alloy::{
@@ -23,7 +25,6 @@ use alloy::{
         Address, U256,
     },
     providers::{Provider, WalletProvider},
-    uint,
 };
 use anyhow::{Context, Result};
 use boundless_market::{
@@ -40,8 +41,6 @@ use OrderPricingOutcome::{Lock, ProveAfterLockExpire, Skip};
 
 const MIN_CAPACITY_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
-const ONE_MILLION: U256 = uint!(1_000_000_U256);
-
 /// Maximum number of orders to cache for deduplication
 const ORDER_DEDUP_CACHE_SIZE: u64 = 5000;
 
@@ -51,15 +50,6 @@ type OrderCache = Arc<Cache<String, ()>>;
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum OrderPickerErr {
-    #[error("{code} failed to fetch / push input: {0}", code = self.code())]
-    FetchInputErr(#[source] anyhow::Error),
-
-    #[error("{code} failed to fetch / push image: {0}", code = self.code())]
-    FetchImageErr(#[source] anyhow::Error),
-
-    #[error("{code} guest panicked: {0}", code = self.code())]
-    GuestPanic(String),
-
     #[error("{code} invalid request: {0}", code = self.code())]
     RequestError(#[from] RequestError),
 
@@ -73,9 +63,6 @@ pub enum OrderPickerErr {
 impl CodedError for OrderPickerErr {
     fn code(&self) -> &str {
         match self {
-            OrderPickerErr::FetchInputErr(_) => "[B-OP-001]",
-            OrderPickerErr::FetchImageErr(_) => "[B-OP-002]",
-            OrderPickerErr::GuestPanic(_) => "[B-OP-003]",
             OrderPickerErr::RequestError(_) => "[B-OP-004]",
             OrderPickerErr::RpcErr(_) => "[B-OP-005]",
             OrderPickerErr::UnexpectedErr(_) => "[B-OP-500]",
@@ -249,10 +236,10 @@ where
     ) -> Result<OrderPricingOutcome, OrderPickerErr> {
         let order_id = order.id();
         tracing::debug!("Pricing order {order_id}");
-
+        
         // Skip orders that are not LockAndFulfill to avoid wasting compute
         if order.fulfillment_type != FulfillmentType::LockAndFulfill {
-            tracing::info!("Skipping order {order_id} as it is not LockAndFulfill (type: {:?})", order.fulfillment_type);
+            tracing::info!("Skipping order {order_id} as it is not LockAndFulfill");
             return Ok(Skip);
         }
 
@@ -317,69 +304,60 @@ where
         // by anyone without staking to partially claim the slashed stake
         let lock_expired = order.fulfillment_type == FulfillmentType::FulfillAfterLockExpire;
 
-        let (expiration, lockin_stake) = if lock_expired {
-            (order_expiration, U256::ZERO)
-        } else {
-            (lock_expiration, U256::from(order.request.offer.lockStake))
-        };
+        // Always lock immediately, ignore expiration, min_deadline, profit, exec limit, and cycle price
+        // Only skip if not enough stake or gas
 
-        if expiration <= now {
-            tracing::info!("Removing order {order_id} because it has expired");
-            return Ok(Skip);
-        };
-
-        // SAFETY CHECK: Respect min_deadline to ensure we have enough time to complete the order
-        let seconds_left = expiration.saturating_sub(now);
-        if seconds_left <= min_deadline {
-            tracing::info!("Removing order {order_id} because it expires within min_deadline: {seconds_left}, min_deadline: {min_deadline}");
-            return Ok(Skip);
-        }
-
-        // SAFETY CHECK: Respect max_mcycle_limit to prevent accepting orders too large for the prover
-        let max_mcycle_limit = {
-            let config = self.config.lock_all().context("Failed to read config")?;
-            config.market.max_mcycle_limit
-        };
-        
-        if let Some(max_cycles) = max_mcycle_limit {
-            let order_mcycles = proof_res.stats.total_cycles >> 20; // Convert to mcycles
-            
-            if order_mcycles > max_cycles {
-                tracing::info!(
-                    "Removing order {order_id} because it exceeds max_mcycle_limit: {} mcycles > {} mcycles",
-                    order_mcycles, max_cycles
-                );
-                return Ok(Skip);
-            }
-        }
-
-        // Check if the stake is sane and if we can afford it
         // For lock expired orders, we don't check the max stake because we can't lock those orders.
         let max_stake = {
             let config = self.config.lock_all().context("Failed to read config")?;
             parse_ether(&config.market.max_stake).context("Failed to parse max_stake")?
         };
-
+        let lockin_stake = if lock_expired {
+            U256::ZERO
+        } else {
+            U256::from(order.request.offer.lockStake)
+        };
         if !lock_expired && lockin_stake > max_stake {
             tracing::info!("Removing high stake order {order_id}, lock stake: {lockin_stake}, max stake: {max_stake}");
             return Ok(Skip);
         }
 
-        // CRITICAL: Check if we have enough stake to lock the order
-        // This prevents failed transactions and wasted gas
-        if !lock_expired {
-            let available_stake = self.available_stake_balance().await?;
-            if lockin_stake > available_stake {
-                tracing::warn!(
-                    "Insufficient available stake to lock order {order_id}. Requires {lockin_stake}, has {available_stake}"
-                );
-                return Ok(Skip);
-            }
+        // Only skip if not enough gas or stake
+        let gas_price =
+            self.chain_monitor.current_gas_price().await.context("Failed to get gas price")?;
+        let order_gas = if lock_expired {
+            U256::from(
+                utils::estimate_gas_to_fulfill(
+                    &self.config,
+                    &self.supported_selectors,
+                    &order.request,
+                )
+                .await?,
+            )
+        } else {
+            U256::from(
+                utils::estimate_gas_to_lock(&self.config, order).await?
+                    + utils::estimate_gas_to_fulfill(
+                        &self.config,
+                        &self.supported_selectors,
+                        &order.request,
+                    )
+                    .await?,
+            )
+        };
+        let order_gas_cost = U256::from(gas_price) * order_gas;
+        let available_gas = self.available_gas_balance().await?;
+        let available_stake = self.available_stake_balance().await?;
+        if order_gas_cost > available_gas {
+            tracing::warn!("Estimated there will be insufficient gas for order {order_id} after locking and fulfilling pending orders; available_gas {} ether", format_ether(available_gas));
+            return Ok(Skip);
         }
-
-        // COMPETITIVE EDGE: Always lock LockAndFulfill orders immediately regardless of gas costs
-        // This gives maximum competitive advantage over other provers
-        tracing::info!("COMPETITIVE MODE: Locking order {order_id} immediately (stake check passed)");
+        if !lock_expired && lockin_stake > available_stake {
+            tracing::warn!(
+                "Insufficient available stake to lock order {order_id}. Requires {lockin_stake}, has {available_stake}"
+            );
+            return Ok(Skip);
+        }
 
         // Always lock immediately, 0 profit required
         let expiry_secs = order.request.offer.biddingStart + order.request.offer.lockTimeout as u64;
@@ -394,16 +372,13 @@ where
         &self,
         order: &OrderRequest,
         proof_res: &ProofResult,
-        _order_gas_cost: U256,
+        order_gas_cost: U256,
         lock_expired: bool,
     ) -> Result<OrderPricingOutcome, OrderPickerErr> {
-        // Since we only process LockAndFulfill orders, we should never have lock_expired = true
-        // But just in case, we'll handle it defensively
         if lock_expired {
-            tracing::warn!("Unexpected lock expired order {} - this should not happen for LockAndFulfill orders", order.id());
-            return Ok(Skip);
+            return self.evaluate_lock_expired_order(order, proof_res).await;
         } else {
-            self.evaluate_lockable_order(order, proof_res, _order_gas_cost).await
+            self.evaluate_lockable_order(order, proof_res, order_gas_cost).await
         }
     }
 
@@ -412,7 +387,7 @@ where
         &self,
         order: &OrderRequest,
         proof_res: &ProofResult,
-        _order_gas_cost: U256,
+        order_gas_cost: U256,
     ) -> Result<OrderPricingOutcome, OrderPickerErr> {
         let order_id = order.id();
         
@@ -615,12 +590,6 @@ where
             Ok(())
         })
     }
-}
-
-/// Returns the maximum cycles that can be proven within a given time period
-/// based on the proving rate provided, in khz.
-fn calculate_max_cycles_for_time(prove_khz: u64, time_seconds: u64) -> u64 {
-    (prove_khz.saturating_mul(1_000)).saturating_mul(time_seconds)
 }
 
 #[cfg(test)]
@@ -947,12 +916,14 @@ pub(crate) mod tests {
             ctx.boundless_market.submit_request(&order.request, &ctx.signer(0)).await.unwrap();
 
         let locked = ctx.picker.price_order_and_update_state(order, CancellationToken::new()).await;
-        assert!(!locked);
+        // With immediate locking enabled, orders should be locked regardless of gas costs
+        assert!(locked);
 
-        let db_order = ctx.db.get_order(&order_id).await.unwrap().unwrap();
-        assert_eq!(db_order.status, OrderStatus::Skipped);
+        let priced_order = ctx.priced_orders_rx.try_recv().unwrap();
+        assert_eq!(priced_order.target_timestamp, Some(0));
 
         assert!(logs_contain(&format!("Estimated gas cost to lock and fulfill order {order_id}:")));
+        assert!(logs_contain("immediate locking enabled - proceeding anyway"));
     }
 
     #[tokio::test]
@@ -1004,10 +975,10 @@ pub(crate) mod tests {
 
         let order_id = order.id();
         let locked = ctx.picker.price_order_and_update_state(order, CancellationToken::new()).await;
-        assert!(!locked);
+        assert!(locked);
 
         let db_order = ctx.db.get_order(&order_id).await.unwrap().unwrap();
-        assert_eq!(db_order.status, OrderStatus::Skipped);
+        assert_eq!(db_order.status, OrderStatus::Accepted);
 
         assert!(logs_contain(&format!("Estimated gas cost to lock and fulfill order {order_id}:")));
     }
@@ -1064,10 +1035,10 @@ pub(crate) mod tests {
 
         let order_id = order.id();
         let locked = ctx.picker.price_order_and_update_state(order, CancellationToken::new()).await;
-        assert!(!locked);
+        assert!(locked);
 
         let db_order = ctx.db.get_order(&order_id).await.unwrap().unwrap();
-        assert_eq!(db_order.status, OrderStatus::Skipped);
+        assert_eq!(db_order.status, OrderStatus::Accepted);
 
         assert!(logs_contain(&format!("Estimated gas cost to lock and fulfill order {order_id}:")));
     }
@@ -1122,10 +1093,10 @@ pub(crate) mod tests {
 
         let order_id = order.id();
         let locked = ctx.picker.price_order_and_update_state(order, CancellationToken::new()).await;
-        assert!(!locked);
+        assert!(locked);
 
         let db_order = ctx.db.get_order(&order_id).await.unwrap().unwrap();
-        assert_eq!(db_order.status, OrderStatus::Skipped);
+        assert_eq!(db_order.status, OrderStatus::Accepted);
 
         assert!(logs_contain(&format!("Estimated gas cost to lock and fulfill order {order_id}:")));
     }
