@@ -16,7 +16,7 @@ use crate::{
 use alloy::{
     network::Ethereum,
     primitives::{
-        utils::{format_ether, parse_units},
+        utils::{parse_units},
         Address, U256,
     },
     providers::{Provider, WalletProvider},
@@ -348,7 +348,7 @@ where
             .map_err(|e| OrderMonitorErr::UnexpectedError(e.into()))?;
         let committed_orders_count: u32 = committed_orders.len().try_into().unwrap();
 
-        Self::log_capacity(prev_orders_by_status, committed_orders, max).await;
+        OrderMonitor::<P>::log_capacity(prev_orders_by_status, committed_orders, max).await;
 
         let available_slots = max.saturating_sub(committed_orders_count);
         Ok(Capacity::Available(available_slots))
@@ -399,7 +399,7 @@ where
     async fn get_valid_orders(
         &self,
         current_block_timestamp: u64,
-        min_deadline: u64,
+        _min_deadline: u64,
     ) -> Result<Vec<Arc<OrderRequest>>> {
         let mut candidate_orders: Vec<Arc<OrderRequest>> = Vec::new();
 
@@ -418,7 +418,7 @@ where
             }
         }
 
-        fn is_target_time_reached(order: &OrderRequest, current_block_timestamp: u64) -> bool {
+        fn is_target_time_reached(order: &OrderRequest, _current_block_timestamp: u64) -> bool {
             // ALWAYS allow orders to proceed - no target timestamp checks for immediate locking
             tracing::debug!("Request {:x} target timestamp check bypassed (immediate locking enabled)", order.request.id);
                         true
@@ -453,7 +453,7 @@ where
                     tracing::debug!("Request 0x{:x} was scheduled to be locked by us, but is already locked by us. Proceeding to prove.", order.request.id);
                     candidate_orders.push(order);
                 }
-            } else if !is_within_deadline(&order, current_block_timestamp, min_deadline) {
+            } else if !is_within_deadline(&order, current_block_timestamp, _min_deadline) {
                 self.skip_order(&order, "insufficient deadline").await;
             } else if is_target_time_reached(&order, current_block_timestamp) {
                 candidate_orders.push(order);
@@ -585,7 +585,7 @@ where
             .await?;
 
         // Log capacity information
-        self.log_capacity(prev_orders_by_status, committed_orders.clone(), capacity_granted as u32).await;
+        OrderMonitor::<P>::log_capacity(prev_orders_by_status, committed_orders.clone(), capacity_granted as u32).await;
 
         // Skip if no capacity available
         let capacity_available = match capacity {

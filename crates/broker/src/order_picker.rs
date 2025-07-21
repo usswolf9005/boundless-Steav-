@@ -11,16 +11,15 @@ use crate::{
     config::{ConfigLock, OrderPricingPriority},
     db::DbObj,
     errors::CodedError,
-    provers::{ProverError, ProverObj},
-    storage::{upload_image_uri, upload_input_uri},
-    task::{RetryRes, RetryTask, SupervisorErr},
-    utils, FulfillmentType, OrderRequest,
+    provers::{ProverObj},
+    utils::{format_ether, parse_ether},
+    FulfillmentType, OrderRequest,
 };
 use crate::{now_timestamp, provers::ProofResult};
 use alloy::{
     network::Ethereum,
     primitives::{
-        utils::{format_ether, format_units, parse_ether, parse_units},
+        utils::{format_ether, parse_ether},
         Address, U256,
     },
     providers::{Provider, WalletProvider},
@@ -343,8 +342,7 @@ where
         };
         
         if let Some(max_cycles) = max_mcycle_limit {
-            let order_cycles = proof_res.stats.total_cycles;
-            let order_mcycles = order_cycles >> 20; // Convert to mcycles
+            let order_mcycles = proof_res.stats.total_cycles >> 20; // Convert to mcycles
             
             if order_mcycles > max_cycles {
                 tracing::info!(
@@ -396,7 +394,7 @@ where
         &self,
         order: &OrderRequest,
         proof_res: &ProofResult,
-        order_gas_cost: U256,
+        _order_gas_cost: U256,
         lock_expired: bool,
     ) -> Result<OrderPricingOutcome, OrderPickerErr> {
         // Since we only process LockAndFulfill orders, we should never have lock_expired = true
@@ -405,7 +403,7 @@ where
             tracing::warn!("Unexpected lock expired order {} - this should not happen for LockAndFulfill orders", order.id());
             return Ok(Skip);
         } else {
-            self.evaluate_lockable_order(order, proof_res, order_gas_cost).await
+            self.evaluate_lockable_order(order, proof_res, _order_gas_cost).await
         }
     }
 
@@ -414,7 +412,7 @@ where
         &self,
         order: &OrderRequest,
         proof_res: &ProofResult,
-        order_gas_cost: U256,
+        _order_gas_cost: U256,
     ) -> Result<OrderPricingOutcome, OrderPickerErr> {
         let order_id = order.id();
         
