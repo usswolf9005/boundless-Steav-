@@ -1,5 +1,3 @@
-// order_monitor.rs
-
 // Copyright (c) 2025 RISC Zero, Inc.
 //
 // All rights reserved.
@@ -426,7 +424,28 @@ where
             true
         }
 
-        // Process only LockAndFulfill orders from lock_and_prove_cache
+        for (_, order) in self.prove_cache.iter() {
+            let is_fulfilled = self
+                .db
+                .is_request_fulfilled(U256::from(order.request.id))
+                .await
+                .context("Failed to check if request is fulfilled")?;
+            if is_fulfilled {
+                tracing::debug!(
+                    "Request 0x{:x} was locked by another prover and was fulfilled. Skipping.",
+                    order.request.id
+                );
+                self.skip_order(&order, "was fulfilled by other").await;
+            } else if !is_within_deadline(&order, current_block_timestamp, min_deadline) {
+                // ALWAYS allow orders to proceed - no deadline checks for immediate locking
+                tracing::debug!("Request {:x} deadline check bypassed (immediate locking enabled)", order.request.id);
+                // Skip this check to allow orders to lock ASAP
+            } else if is_target_time_reached(&order, current_block_timestamp) {
+                tracing::info!("Request 0x{:x} was locked by another prover but expired unfulfilled, setting status to pending proving", order.request.id);
+                candidate_orders.push(order);
+            }
+        }
+
         for (_, order) in self.lock_and_prove_cache.iter() {
             let is_lock_expired = order.request.lock_expires_at() < current_block_timestamp;
             if is_lock_expired {
