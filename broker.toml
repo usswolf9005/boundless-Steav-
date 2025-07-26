@@ -22,7 +22,7 @@ priority_requestor_addresses = [
 # Used to estimate proving capacity and accept only as much work as the prover can handle. Estimates
 # can be derived from benchmarking using Bento CLI or from data based on fulfilling market orders.
 # For more information, see https://docs.beboundless.xyz/provers/broker#benchmarking-bento
-peak_prove_khz = 400
+peak_prove_khz = 200
 # Optional max cycles (in mcycles)
 #
 # Orders over this max_cycles will be skipped after preflight
@@ -51,11 +51,11 @@ max_file_size = 75_000_000
 # Max concurrent locks
 #
 # Maximum number of concurrent proofs that can be processed at once
-max_concurrent_proofs = 4
+max_concurrent_proofs = 1
 # Maximum number of orders to concurrently work on pricing
 #
 # Used to limit pricing tasks spawned to prevent overwhelming the system
-max_concurrent_preflights = 6
+max_concurrent_preflights = 3
 # Order pricing priority mode
 #
 # Determines how orders are prioritized for pricing. Options:
@@ -73,7 +73,7 @@ order_commitment_priority = "shortest_expiry"
 #
 # The broker service has a number of subtasks. Some are considered critical. If a task fails, it
 # will be retried, but after this number of retries, the process will exit.
-max_critical_task_retries = 12
+max_critical_task_retries = 6
 # Optional allow list for customer address.
 #
 # If enabled, all requests from clients not in the allow list are skipped.
