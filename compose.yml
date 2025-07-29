@@ -197,18 +197,18 @@ services:
               device_ids: ['2']
               capabilities: [gpu]
 
-  gpu_prove_agent3:
-    <<: *agent-common
-    mem_limit: 8G
-    cpus: 2
-    entrypoint: /app/agent -t prove
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ['3']
-              capabilities: [gpu]
+#  gpu_prove_agent3:
+#    <<: *agent-common
+#    mem_limit: 8G
+#    cpus: 2
+#    entrypoint: /app/agent -t prove
+#    deploy:
+#      resources:
+#       reservations:
+#          devices:
+#            - driver: nvidia
+#              device_ids: ['3']
+#              capabilities: [gpu]
 
 
   snark_agent:
@@ -242,7 +242,7 @@ services:
       - gpu_prove_agent0
       - gpu_prove_agent1
       - gpu_prove_agent2
-      - gpu_prove_agent3
+#      - gpu_prove_agent3
       - exec_agent0
       - exec_agent1
       - aux_agent
